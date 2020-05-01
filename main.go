@@ -31,7 +31,7 @@ var (
 )
 
 func getEnv() {
-	awsRegion = os.Getenv("VTV_REGION")
+	awsRegion = os.Getenv("VT_REGION")
 	awsBucket = os.Getenv("AWS_BUCKET")
 	dynamoTableName = os.Getenv("AWS_TABLE")
 	batchSize, _ = strconv.Atoi(os.Getenv("BATCH_SIZE"))
