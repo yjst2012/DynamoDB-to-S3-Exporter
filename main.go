@@ -115,13 +115,13 @@ func handleRequest(ctx context.Context) error {
 	checkErrorWithMsg("write error", writer.Error())
 	file.Close()
 
-	// aws session for BI s3 bucket
-	log.Println("Initialising AWS session for BI S3 bucket ...")
+	// aws session for new s3 bucket
+	log.Println("Initialising AWS session for new S3 bucket ...")
 	sessBI, err := session.NewSession(&aws.Config{
 		Region:      aws.String(awsRegion),
 		Credentials: credentials.NewStaticCredentials(awsSecretID, awsSecretKey, ""),
 	})
-	checkErrorWithMsg("Error starting aws BI session", err)
+	checkErrorWithMsg("Error starting aws new session", err)
 
 	creds := stscreds.NewCredentials(sessBI, awsRole, func(arp *stscreds.AssumeRoleProvider) {
 		arp.Duration = 60 * time.Minute
