@@ -28,7 +28,52 @@ var (
 	awsSecretKey    string = ""
 	awsRole         string = ""
 	batchSize       int    = 0
+	filename        string = "/tmp/dynamo.csv"
 )
+
+// Data is the basic structure
+type Data struct {
+	UUID     string `json:"UUID"`
+	Customer string `json:"Customer"`
+}
+
+func main() {
+	lambda.Start(handleRequest)
+}
+
+func handleRequest(ctx context.Context) error {
+	getEnv()
+
+	// create local file
+	file, err := os.Create(filename)
+	logErrorWithMsg("failed to open local file "+filename, err)
+	defer file.Close()
+
+	// fetch all records from dynamodb
+	records, err := fetchDyanmoRecords()
+	logErrorWithMsg("failed to fetch dyanmodb", err)
+
+	// set up csv writter
+	writer := csv.NewWriter(file)
+	writer.Comma = ','
+	encoder := struct2csv.New()
+	encoder.SetSeparators("\"", "\"")
+	data, err := encoder.Marshal(records, true)
+	logErrorWithMsg("failed to encode", err)
+
+	// write to local file
+	writer.WriteAll(data)
+	logErrorWithMsg("write error", writer.Error())
+	writer.Flush()
+	log.Printf("total records written %d to local file", len(records))
+
+	// upload to s3 bucket
+	destPath := genDestFileName()
+	upload2S3(filename, destPath)
+
+	fmt.Printf("\nSuccessfully uploaded DynamoDB file to s3://%s/%s\n", awsBucket, destPath)
+	return nil
+}
 
 func getEnv() {
 	awsRegion = os.Getenv("VT_REGION")
@@ -40,35 +85,13 @@ func getEnv() {
 	awsRole = os.Getenv("AWS_ROLE")
 }
 
-type Data struct {
-	UUID     string `json:"UUID"`
-	Customer string `json:"Customer"`
-}
-
-func main() {
-	lambda.Start(handleRequest)
-	//handleRequest(context.TODO())
-}
-
-func handleRequest(ctx context.Context) error {
-	getEnv()
-
+func initDynamoTableConnection() *dynamo.Table {
 	// aws session for dynamodb connection
 	log.Println("Initialising AWS session for DynamoDB ...")
 	sess, err := session.NewSession(&aws.Config{
 		Region: aws.String(awsRegion),
 	})
-	checkErrorWithMsg("Error starting aws DynamoDB session: %v", err)
-
-	// create local file
-	filename := "/tmp/dynamo.csv"
-	file, err := os.Create(filename)
-	checkErrorWithMsg("failed to open local file "+filename, err)
-	writer := csv.NewWriter(file)
-	writer.Comma = ','
-	enc := struct2csv.New()
-	enc.SetSeparators("\"", "\"")
-
+	logErrorWithMsg("Error starting aws DynamoDB session: %v", err)
 	// read dynamodb
 	db := dynamo.New(sess, &aws.Config{})
 	if db == nil {
@@ -79,65 +102,37 @@ func handleRequest(ctx context.Context) error {
 	}
 	table := db.Table(dynamoTableName)
 	log.Println("dynamodb connection initialised", dynamoTableName)
+	return &table
+}
 
-	// retrieve records in batch
-	all := 0
-	withHeader := true
-	customers := make([]Data, batchSize)
-	itr := table.Scan().SearchLimit(int64(batchSize)).Iter()
-	for {
-		i := 0
-		quit := false
-		for ; i < batchSize; i++ {
-			more := itr.Next(&customers[i])
-			if itr.Err() != nil {
-				log.Println("unexpected error", itr.Err())
-			}
-			if !more {
-				quit = true
-				break
-			}
-			//log.Println(customers[i].Customer)
-		}
-		all += i
-		valid := customers[:i]
-		data, err := enc.Marshal(valid, withHeader)
-		checkErrorWithMsg("enc marshal failed", err)
-		withHeader = false
-		writer.WriteAll(data)
-		if quit {
-			break
-		}
-		itr = table.Scan().StartFrom(itr.LastEvaluatedKey()).SearchLimit(int64(batchSize)).Iter()
+func fetchDyanmoRecords() ([]Data, error) {
+	table := initDynamoTableConnection()
+	records := []Data{}
+	if err := table.Scan().All(&records); err != nil {
+		return records, err
 	}
-	log.Println("total records", all)
-	writer.Flush()
-	checkErrorWithMsg("write error", writer.Error())
-	file.Close()
+	return records, nil
+}
 
-	// aws session for new s3 bucket
+func upload2S3(src, dest string) {
+	// set up different aws session for new s3 bucket
 	log.Println("Initialising AWS session for new S3 bucket ...")
 	sessBI, err := session.NewSession(&aws.Config{
 		Region:      aws.String(awsRegion),
 		Credentials: credentials.NewStaticCredentials(awsSecretID, awsSecretKey, ""),
 	})
-	checkErrorWithMsg("Error starting aws new session", err)
-
+	logErrorWithMsg("Error starting aws new session", err)
 	creds := stscreds.NewCredentials(sessBI, awsRole, func(arp *stscreds.AssumeRoleProvider) {
 		arp.Duration = 60 * time.Minute
 		arp.ExpiryWindow = 30 * time.Second
 	})
 	svc := s3.New(sessBI, aws.NewConfig().WithCredentials(creds))
 
-	now := time.Now()
-	year, month, day := now.Date()
-	date := now.Format("20060102150405")
 	reader, err := os.Open(filename)
-	checkErrorWithMsg("Unable to open file", err)
-
+	logErrorWithMsg("Unable to open local file", err)
 	defer reader.Close()
-	dest := fmt.Sprintf("dynamo/%04d/%02d/%02d/TT_%s.csv", year, month, day, date)
-	log.Printf("using identity (%s) for uploading of (%s)", awsRole, dest)
+
+	log.Printf("using identity (%s) for s3 uploading for (%s)", awsRole, dest)
 	uploader := s3manager.NewUploaderWithClient(svc)
 	_, err = uploader.Upload(&s3manager.UploadInput{
 		Bucket: aws.String(awsBucket),
@@ -148,12 +143,19 @@ func handleRequest(ctx context.Context) error {
 		// ContentDisposition:   aws.String("attachment"),
 		// ServerSideEncryption: aws.String("AES256"),
 	})
-	checkErrorWithMsg("failed to upload to s3://"+awsBucket+"/"+dest, err)
-	fmt.Printf("\nSuccessfully uploaded DynamoDB file to s3://%s/%s\n", awsBucket, dest)
-	return nil
+	logErrorWithMsg("failed to upload to s3://"+awsBucket+"/"+dest, err)
+	return
 }
 
-func checkErrorWithMsg(message string, err error) {
+func genDestFileName() string {
+	now := time.Now()
+	year, month, day := now.Date()
+	date := now.Format("20060102150405")
+	dest := fmt.Sprintf("dynamo/%04d/%02d/%02d/TT_%s.csv", year, month, day, date)
+	return dest
+}
+
+func logErrorWithMsg(message string, err error) {
 	if err != nil {
 		log.Fatal(message, err)
 	}
